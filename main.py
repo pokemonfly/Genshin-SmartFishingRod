@@ -1,80 +1,79 @@
-import ctypes
-import multiprocessing
-import sys
-from threading import Thread
-from time import sleep
-
-import cv2
-import numpy as np
+from fish import Monitor, Hotkey, Detector
+from ctypes import windll
+import yaml
 from loguru import logger
-
-from automaton import Genshin, Overlay, Detector, Hotkey
-from automaton import alpha_mask, choose_model
-
-
-class Timer(Thread):
-    def __init__(self, game):
-        super().__init__(daemon=True)
-        self.game = game
-        self.start()
-
-    def run(self):
-        global dps
-        while True:
-            logger.info(f'{dps} detects per second.')
-            dps = 0
-            sleep(1)
+from time import sleep
 
 
 def main():
-    global dps
+    windll.shcore.SetProcessDpiAwareness(1)
+    # load config
+    init_mode = False
+    configs = None
+    try:
+        with open('cfg.yml') as cfg:
+            configs = yaml.safe_load(cfg)
+    except FileNotFoundError:
+        init_mode = True
+        logger.info("""
+            首次使用需要执行程序初始化:
+                进入钓鱼界面抛竿前按下Alt+1;
+                鱼上钩出现进度条后(游标在最左边时)按下Alt+2
+            程序初始化之后会自动结束
+            如判断有问题, 钓鱼过程中按下Alt+3, 然后检查images目录下的screen_[timestamp].bmp文件标记的位置是否正确.
+            如位置有偏差可修改cfg.yml
+        """)
 
-    game = Genshin()
-    overlay = Overlay(game.hwnd)
+    monitor = Monitor()
     hotkey = Hotkey()
+    detector = Detector(configs)
 
-    model_name = choose_model(game.screencap())
-    logger.info(f'Loading module "{model_name}"')
-    detector = Detector(model_name)
-
-    Timer(game)
-    hide_ui = False
+    # 当前鼠标状态
+    mouse_is_pressed = None
+    logger.info("开始摸鱼")
     while True:
-        screen = game.screencap()
-        groups, cover = detector.match_template(screen)
+        screen = monitor.screencap()
+        marks = None
+        # 是否正在钓鱼
+        is_fishing = False
 
-        progress_found = False
-        if 'hook' in groups:
-            result = detector.match_progress(screen, groups['hook'], cover)
-            if result is not None:
-                progress_found = True
-                game.mouse(result)
-        if 'button' in groups and not progress_found:
-            game.mouse(True)
-            sleep(0.1)
-            game.mouse(False)
+        if not init_mode:
+            is_wait, is_rise, mark_arr1 = detector.match_icon(screen)
+            if is_wait:
+                if mouse_is_pressed:
+                    # 上钩后 释放鼠标
+                    monitor.mouse(False)
+                    mouse_is_pressed = None
+                continue
+
+            is_progress, mark_arr2 = detector.match_progress(screen)
+            if is_progress is not None:
+                is_fishing = True
+                mouse_is_pressed = is_progress
+                monitor.mouse(is_progress)
+                sleep(0.04)
+
+            if is_rise and not is_fishing:
+                # 点击提钩
+                sleep(0.1)
+                monitor.mouse(True)
+                sleep(0.1)
+                monitor.mouse(False)
+                
+            marks = [mark_arr1] + mark_arr2
 
         if key := hotkey.get():
             if key[0] == 'NUMPAD':
-                if key[1]:
-                    detector.clip_image(screen, key[1])
-                else:
-                    image = cv2.resize(alpha_mask(screen), cover.shape[1::-1], interpolation=cv2.INTER_NEAREST)
-                    cv2.imshow('Configuration', cv2.add(image, cover))
-                    cv2.waitKey(0)
-            else:
-                hide_ui = not hide_ui
-
-        if hide_ui:
-            cover = np.zeros(cover.shape, dtype=np.uint8)
-        overlay.update(cover)
-        dps += 1
+                if key[1] == 1:
+                    detector.init_pos_icon(screen)
+                elif key[1] == 2:
+                    detector.init_pos_icon(screen, mode='rise')
+                    detector.init_pos_process(screen)
+                elif key[1] == 3:
+                    detector.save_screen(screen, None)
+                elif key[1] == 4:
+                    detector.save_screen(screen, marks)
 
 
 if __name__ == '__main__':
-    multiprocessing.freeze_support()  # 为了 pyinstaller 正常打包
-    if ctypes.windll.shell32.IsUserAnAdmin():
-        dps = 0
-        main()
-    else:  # 自动以管理员身份重启
-        ctypes.windll.shell32.ShellExecuteW(None, 'runas', sys.executable, __file__, None, 1)
+    main()
